@@ -252,6 +252,7 @@ class MilvusDocumentStore:
             self.collection_name,
             filter="",
             output_fields=[count_expr],
+            partition_names=self.partition_names,
         )
         doc_num = res[0][count_expr]
         return doc_num
@@ -340,6 +341,7 @@ class MilvusDocumentStore:
                 filter=expr,
                 output_fields=output_fields,
                 limit=MAX_LIMIT_SIZE,
+                partition_names=self.partition_names,
             )
         except MilvusException as err:
             logger.error("Failed to query documents with filters expr: %s", expr)
@@ -422,16 +424,8 @@ class MilvusDocumentStore:
             return 0
 
         # If the collection hasn't been initialized yet, perform all steps to do so
-        kwargs: Dict[str, Any] = {}
         if not self.col:
-            kwargs = {"embeddings": embeddings, "metas": metas}
-            if self.partition_names:
-                kwargs["partition_names"] = self.partition_names
-            if self.replica_number:
-                kwargs["replica_number"] = self.replica_number
-            if self.timeout:
-                kwargs["timeout"] = self.timeout
-            self._init(**kwargs)
+            self._init(embeddings=embeddings, metas=metas, timeout=self.timeout)
 
         insert_list: list[dict] = []
         for i in range(len(ids)):
@@ -557,7 +551,6 @@ class MilvusDocumentStore:
         embeddings: Optional[List] = None,
         metas: Optional[List[Dict]] = None,
         timeout: Optional[float] = None,
-        **_kwargs: Any,
     ) -> None:
         if embeddings is not None:
             self._create_collection(embeddings, metas)
@@ -754,6 +747,7 @@ class MilvusDocumentStore:
             limit=top_k,
             filter=expr,
             output_fields=output_fields,
+            partition_names=self.partition_names,
             timeout=None,
         )
         distance_to_score_fn = self._select_score_fn()
@@ -806,6 +800,7 @@ class MilvusDocumentStore:
             limit=top_k,
             filter=expr,
             output_fields=output_fields,
+            partition_names=self.partition_names,
             timeout=None,
         )
         docs = self._parse_search_result(res)
@@ -868,7 +863,12 @@ class MilvusDocumentStore:
 
         # Search topK docs based on dense and sparse vectors and rerank.
         res = self.client.hybrid_search(
-            self.collection_name, [dense_req, sparse_req], ranker=reranker, limit=top_k, output_fields=output_fields
+            self.collection_name,
+            [dense_req, sparse_req],
+            ranker=reranker,
+            limit=top_k,
+            output_fields=output_fields,
+            partition_names=self.partition_names,
         )
         docs = self._parse_search_result(res)
         return docs
