@@ -17,9 +17,11 @@ jobs:
     name: Run Lint and Tests
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         python-version: [ '3.9' ]
-    
+        pymilvus-version: [ '2.5.*', '2.6.*' ]
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
@@ -34,6 +36,9 @@ jobs:
 
       - name: Lint
         run: hatch run lint:all
+
+      - name: Pin pymilvus ${{ matrix.pymilvus-version }}
+        run: hatch run pip install "pymilvus==${{ matrix.pymilvus-version }}"
 
       - name: Run Milvus
         run: |

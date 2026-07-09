@@ -11,12 +11,14 @@ from haystack.errors import FilterError
 from haystack.utils import Secret, deserialize_secrets_inplace
 from pymilvus import (
     AnnSearchRequest,
+    Collection,
     CollectionSchema,
     DataType,
     FieldSchema,
     MilvusClient,
     MilvusException,
     RRFRanker,
+    connections,
 )
 from pymilvus.client.abstract import BaseRanker
 from pymilvus.client.types import LoadState
@@ -195,17 +197,22 @@ class MilvusDocumentStore:
         resolved_args = connection_args if connection_args is not None else DEFAULT_MILVUS_CONNECTION
         self.connection_args = resolved_args
         self._milvus_client = MilvusClient(**resolved_args)
-        self.col: bool = False  # True when the collection is ready to use
+        self.alias = self.client._using
+        # Since pymilvus 2.6.x, MilvusClient no longer registers its connection
+        # with the ORM `connections` registry; register its handler so the ORM
+        # `Collection` exposed by `self.col` can find the connection.
+        if hasattr(connections, "_alias_handlers"):
+            connections._alias_handlers.setdefault(self.alias, self.client._get_connection())
+        self._col_cache: Optional[Collection] = None
+        self._cache_key: Optional[str] = None
 
-        # Grab the existing collection if it exists
+        # Apply properties to the existing collection if it exists
         if self.client.has_collection(self.collection_name):
-            self.col = True
             if self.collection_properties is not None:
                 self.client.alter_collection_properties(self.collection_name, self.collection_properties)
-        # If need to drop old, drop it
-        if drop_old and self.col:
-            self.client.drop_collection(self.collection_name)
-            self.col = False
+            # If need to drop old, drop it
+            if drop_old:
+                self._drop_collection()
 
         # Initialize the vector store
         self._init(timeout=timeout)
@@ -238,13 +245,40 @@ class MilvusDocumentStore:
         """Get client."""
         return self._milvus_client
 
+    @property
+    def col(self) -> Optional[Collection]:
+        """The ORM Collection object, or None if the collection does not exist.
+
+        Kept for backward compatibility with code that accesses `store.col`;
+        internal operations use the `MilvusClient` API via `self.client`.
+        """
+        current_key = f"{self.collection_name}:{self.alias}"
+        if self._cache_key == current_key and self._col_cache is not None:
+            return self._col_cache
+        if self.client.has_collection(self.collection_name):
+            self._col_cache = Collection(self.collection_name, using=self.alias)
+            self._cache_key = current_key
+            return self._col_cache
+        return None
+
+    def _drop_collection(self) -> None:
+        self.client.drop_collection(self.collection_name)
+        # pymilvus keeps the dropped collection's schema in a connection-level
+        # cache, so recreating a collection with the same name can read back
+        # stale schema. See https://github.com/milvus-io/pymilvus/issues/3058
+        conn = self.client._get_connection()
+        if hasattr(conn, "schema_cache"):
+            conn.schema_cache.pop(self.collection_name, None)
+        self._col_cache = None
+        self._cache_key = None
+
     def count_documents(self) -> int:
         """
         Returns how many documents are present in the document store.
 
         :return: The number of documents in the document store.
         """
-        if not self.col:
+        if self.col is None:
             logger.debug("No existing collection to count.")
             return 0
         count_expr = "count(*)"
@@ -323,7 +357,7 @@ class MilvusDocumentStore:
         :param filters: The filters to apply to the document list.
         :return: A list of Documents that match the given filters.
         """
-        if not self.col:
+        if self.col is None:
             logger.debug("No existing collection to filter.")
             return []
         output_fields = self._get_output_fields()
@@ -424,7 +458,7 @@ class MilvusDocumentStore:
             return 0
 
         # If the collection hasn't been initialized yet, perform all steps to do so
-        if not self.col:
+        if self.col is None:
             self._init(embeddings=embeddings, metas=metas, timeout=self.timeout)
 
         insert_list: list[dict] = []
@@ -452,7 +486,7 @@ class MilvusDocumentStore:
         total_count = len(insert_list)
         batch_size = 1000
         wrote_ids = []
-        if not self.col:
+        if self.col is None:
             raise MilvusException(message="Collection is not initialized")
         for i in range(0, total_count, batch_size):
             # Grab end index
@@ -473,7 +507,7 @@ class MilvusDocumentStore:
 
         :param document_ids: The object_ids to delete
         """
-        if not self.col:
+        if self.col is None:
             logger.debug("No existing collection to delete.")
             return None
         expr = "id in ['" + "','".join(document_ids) + "']"
@@ -607,7 +641,6 @@ class MilvusDocumentStore:
                 schema=schema,
                 consistency_level=self.consistency_level,
             )
-            self.col = True
             # Set the collection properties if they exist
             if self.collection_properties is not None:
                 self.client.alter_collection_properties(self.collection_name, self.collection_properties)
@@ -617,14 +650,14 @@ class MilvusDocumentStore:
 
     def _extract_fields(self) -> None:
         """Grab the existing fields from the Collection"""
-        if self.col:
+        if self.col is not None:
             schema_info = self.client.describe_collection(self.collection_name)
             for x in schema_info["fields"]:
                 self.fields.append(x["name"])
 
     def _create_index(self) -> None:
         """Create an index on the collection"""
-        if self.col and self._get_index() is None:
+        if self.col is not None and self._get_index() is None:
             try:
                 # If no index params, use a default AUTOINDEX based one
                 if self.index_params is None:
@@ -679,28 +712,46 @@ class MilvusDocumentStore:
 
     def _create_search_params(self) -> None:
         """Generate search params based on the current index type"""
-        if self.col and self.search_params is None:
+        if self.col is not None and self.search_params is None:
             index = self._get_index()
             if index is not None:
-                index_type: str = index["index_type"]
-                metric_type: str = index["metric_type"]
+                index_type: str = index["index_param"]["index_type"]
+                metric_type: str = index["index_param"]["metric_type"]
                 self.search_params = self.default_search_params[index_type]  # {"metric_type": "L2", "params": {}}
                 self.search_params["metric_type"] = metric_type
 
     def _get_index(self) -> Optional[Dict[str, Any]]:
         """Return the vector index information if it exists"""
-        if self.col:
-            return self.client.describe_index(self.collection_name, self._vector_field)
+        # `MilvusClient.describe_index` raises when the field has no index yet,
+        # so keep the ORM index iteration here: it simply yields nothing on the
+        # first-time index creation path.
+        col = self.col
+        if col is not None:
+            for x in col.indexes:
+                if x.field_name == self._vector_field:
+                    return x.to_dict()
         return None
 
     def _load(self, timeout: Optional[float] = None) -> None:
         """Load the collection if available."""
         if (
-            self.col
+            self.col is not None
             and self._get_index() is not None
             and self.client.get_load_state(self.collection_name)["state"] == LoadState.NotLoad
         ):
-            self.client.load_collection(self.collection_name, timeout=timeout)
+            if self.partition_names:
+                self.client.load_partitions(
+                    self.collection_name,
+                    partition_names=self.partition_names,
+                    replica_number=self.replica_number,
+                    timeout=timeout,
+                )
+            else:
+                self.client.load_collection(
+                    self.collection_name,
+                    replica_number=self.replica_number,
+                    timeout=timeout,
+                )
 
     def _resolve_value(self, secret: Union[str, Secret]):
         if isinstance(secret, Secret):
@@ -723,7 +774,7 @@ class MilvusDocumentStore:
         query_text: Optional[str] = None,
     ) -> List[Document]:
         """Dense embedding retrieval"""
-        if not self.col:
+        if self.col is None:
             logger.debug("No existing collection to search.")
             return []
 
@@ -762,7 +813,7 @@ class MilvusDocumentStore:
         query_text: Optional[str] = None,
     ) -> List[Document]:
         """Sparse embedding retrieval"""
-        if not self.col:
+        if self.col is None:
             logger.debug("No existing collection to search.")
             return []
         if self._sparse_vector_field is None:
@@ -816,7 +867,7 @@ class MilvusDocumentStore:
         query_text: Optional[str] = None,
     ) -> List[Document]:
         """Hybrid retrieval using both dense and sparse embeddings"""
-        if not self.col:
+        if self.col is None:
             logger.debug("No existing collection to search.")
             return []
         if self._sparse_vector_field is None:
